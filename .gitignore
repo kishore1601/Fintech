@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Angular
+.angular/
+dist/
+.sass-cache/
+connect.lock
+coverage/
+libpeerconnection.log
+npm-debug.log
+yarn-error.log
+testem.log
+typings/
+
+# IDE and System
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Agentic Support
+.gemini/
