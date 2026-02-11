@@ -43,33 +43,54 @@ export class LoanService {
 
     // State
     connectionError = signal<string | null>(null);
+    isOffline = signal(false);
 
     // Trigger to refresh data
     private refreshTrigger = new BehaviorSubject<void>(undefined);
 
-    // Resource: Borrowers
-    // We fetch all borrowers to populate the directory.
+    // Resource: Borrowers (with offline cache)
     private borrowersResponse$ = this.refreshTrigger.pipe(
         switchMap(() => this.http.get<Borrower[]>(`${this.apiUrl}/borrowers`).pipe(
-            tap(() => this.connectionError.set(null)), // Clear error on success
+            tap((data) => {
+                this.connectionError.set(null);
+                this.isOffline.set(false);
+                if (typeof localStorage !== 'undefined') {
+                    localStorage.setItem('kf_borrowers_cache', JSON.stringify(data));
+                }
+            }),
             catchError(err => {
                 console.error('API Error (Borrowers):', err);
-                this.connectionError.set('Could not connect to backend server. Ensure it is running on port 3000.');
+                this.isOffline.set(true);
+                this.connectionError.set('Offline mode — showing cached data.');
+                if (typeof localStorage !== 'undefined') {
+                    const cached = localStorage.getItem('kf_borrowers_cache');
+                    if (cached) return of(JSON.parse(cached) as Borrower[]);
+                }
                 return of([] as Borrower[]);
             })
         ))
     );
     borrowers = toSignal(this.borrowersResponse$, { initialValue: [] });
 
-    // Resource: Transactions (All Loans)
-    // We fetch all loans to populate the table.
+    // Resource: Transactions (with offline cache)
     private transactions$ = this.refreshTrigger.pipe(
         switchMap(() => this.http.get<Transaction[]>(`${this.apiUrl}/loans`).pipe(
-            tap(() => this.connectionError.set(null)), // Clear error on success
+            tap((data) => {
+                this.connectionError.set(null);
+                this.isOffline.set(false);
+                if (typeof localStorage !== 'undefined') {
+                    localStorage.setItem('kf_transactions_cache', JSON.stringify(data));
+                }
+            }),
             catchError(err => {
                 console.error('API Error:', err);
-                this.connectionError.set('Could not connect to backend server. Ensure it is running on port 3000.');
-                return of([] as Transaction[]); // Return empty list to prevent crash
+                this.isOffline.set(true);
+                this.connectionError.set('Offline mode — showing cached data.');
+                if (typeof localStorage !== 'undefined') {
+                    const cached = localStorage.getItem('kf_transactions_cache');
+                    if (cached) return of(JSON.parse(cached) as Transaction[]);
+                }
+                return of([] as Transaction[]);
             })
         ))
     );
@@ -108,6 +129,125 @@ export class LoanService {
         .filter(t => t.frequency === 'Monthly' && this.getStatus(t) === 'Active')
         .reduce((acc, t) => acc + (Number(t.installmentAmount) || 0), 0)
     );
+
+    // === ANALYTICS COMPUTED SIGNALS ===
+
+    // 1. Pie Chart — Loan Status Breakdown
+    loanStatusBreakdown = computed(() => {
+        const txns = this.transactions();
+        let active = 0, paidOff = 0, overdue = 0, profit = 0;
+        for (const t of txns) {
+            const s = this.getStatus(t);
+            if (s === 'Active') {
+                // Check if overdue (active loan older than 90 days with <50% repayment)
+                const ageMs = Date.now() - new Date(t.dateGiven).getTime();
+                const ageDays = ageMs / (1000 * 3600 * 24);
+                const ratio = this.getAmountReceived(t) / t.amountGiven;
+                if (ageDays > 90 && ratio < 0.5) {
+                    overdue++;
+                } else {
+                    active++;
+                }
+            } else if (s === 'Paid Off') paidOff++;
+            else if (s === 'Profit') profit++;
+        }
+        return { active, paidOff, overdue, profit, total: txns.length };
+    });
+
+    // 2. Interest Earned Tracker
+    interestStats = computed(() => {
+        const txns = this.transactions();
+        let totalPrincipal = 0;
+        let totalReceived = 0;
+        let interestEarned = 0;
+
+        for (const t of txns) {
+            totalPrincipal += Number(t.amountGiven);
+            const received = this.getAmountReceived(t);
+            totalReceived += received;
+            if (received > t.amountGiven) {
+                interestEarned += (received - t.amountGiven);
+            }
+        }
+
+        const ratio = totalPrincipal > 0 ? (interestEarned / totalPrincipal) * 100 : 0;
+        return { totalPrincipal, totalReceived, interestEarned, ratio };
+    });
+
+    // 3. Cash Flow Forecast (30/60/90 days)
+    cashFlowForecast = computed(() => {
+        const txns = this.transactions();
+        let forecast30 = 0, forecast60 = 0, forecast90 = 0;
+
+        for (const t of txns) {
+            const status = this.getStatus(t);
+            if (status !== 'Active') continue;
+
+            const installment = Number(t.installmentAmount) || 0;
+            if (installment <= 0) continue;
+
+            if (t.frequency === 'Monthly') {
+                forecast30 += installment;       // 1 month
+                forecast60 += installment * 2;   // 2 months
+                forecast90 += installment * 3;   // 3 months
+            } else {
+                // Weekly
+                forecast30 += installment * 4;   // ~4 weeks
+                forecast60 += installment * 8;   // ~8 weeks
+                forecast90 += installment * 13;  // ~13 weeks
+            }
+        }
+
+        return { forecast30, forecast60, forecast90 };
+    });
+
+    // 4. Top Borrowers (by outstanding + by profit)
+    topBorrowers = computed(() => {
+        const txns = this.transactions();
+        const borrowerMap = new Map<string, { name: string, outstanding: number, profit: number }>();
+
+        for (const t of txns) {
+            const current = borrowerMap.get(t.name) || { name: t.name, outstanding: 0, profit: 0 };
+            const received = this.getAmountReceived(t);
+            const outstanding = t.amountGiven - received;
+
+            if (outstanding > 0) current.outstanding += outstanding;
+            if (received > t.amountGiven) current.profit += (received - t.amountGiven);
+
+            borrowerMap.set(t.name, current);
+        }
+
+        const all = Array.from(borrowerMap.values());
+        const byOutstanding = [...all].sort((a, b) => b.outstanding - a.outstanding).slice(0, 5);
+        const byProfit = [...all].sort((a, b) => b.profit - a.profit).slice(0, 5);
+
+        return { byOutstanding, byProfit };
+    });
+
+    // 5. Overdue Loans
+    overdueLoans = computed(() => {
+        const txns = this.transactions();
+        const overdue: { name: string, amount: number, daysSince: number, repaidRatio: number }[] = [];
+
+        for (const t of txns) {
+            if (this.getStatus(t) !== 'Active') continue;
+            const ageMs = Date.now() - new Date(t.dateGiven).getTime();
+            const ageDays = Math.floor(ageMs / (1000 * 3600 * 24));
+            const received = this.getAmountReceived(t);
+            const ratio = t.amountGiven > 0 ? received / t.amountGiven : 0;
+
+            if (ageDays > 90 && ratio < 0.5) {
+                overdue.push({
+                    name: t.name,
+                    amount: t.amountGiven - received,
+                    daysSince: ageDays,
+                    repaidRatio: Math.round(ratio * 100)
+                });
+            }
+        }
+
+        return overdue.sort((a, b) => b.amount - a.amount);
+    });
 
     // Helpers
     getAmountReceived(t: Transaction): number {
@@ -294,5 +434,86 @@ export class LoanService {
         } else {
             return linePath;
         }
+    }
+
+    // === BACKUP & RESTORE ===
+    exportData() {
+        const data = {
+            exportDate: new Date().toISOString(),
+            app: 'KishoreFintech',
+            borrowers: this.borrowers(),
+            transactions: this.transactions()
+        };
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `kishorefintech-backup-${new Date().toISOString().split('T')[0]}.json`;
+        a.click();
+        URL.revokeObjectURL(url);
+    }
+
+    importData(file: File): Promise<string> {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = (e) => {
+                try {
+                    const data = JSON.parse(e.target?.result as string);
+                    if (!data.borrowers || !data.transactions) {
+                        reject('Invalid backup file format.');
+                        return;
+                    }
+
+                    // Store in local cache immediately
+                    if (typeof localStorage !== 'undefined') {
+                        localStorage.setItem('kf_borrowers_cache', JSON.stringify(data.borrowers));
+                        localStorage.setItem('kf_transactions_cache', JSON.stringify(data.transactions));
+                    }
+
+                    // Try to POST borrowers to API
+                    let completed = 0;
+                    const total = data.borrowers.length;
+                    if (total === 0) {
+                        this.refreshTrigger.next();
+                        resolve('Backup restored successfully (0 borrowers).');
+                        return;
+                    }
+
+                    for (const b of data.borrowers) {
+                        this.http.post(`${this.apiUrl}/borrowers`, b).subscribe({
+                            next: () => {
+                                completed++;
+                                if (completed === total) {
+                                    this.refreshTrigger.next();
+                                    resolve(`Restored ${total} borrowers successfully.`);
+                                }
+                            },
+                            error: () => {
+                                completed++;
+                                if (completed === total) {
+                                    this.refreshTrigger.next();
+                                    resolve(`Restored with some errors. ${completed} attempted.`);
+                                }
+                            }
+                        });
+                    }
+                } catch {
+                    reject('Could not parse backup file.');
+                }
+            };
+            reader.readAsText(file);
+        });
+    }
+
+    // === NEW FEATURES ===
+
+    getAuditLog() {
+        return this.http.get<{ type: string, message: string, timestamp: string }[]>(`${this.apiUrl}/audit-log`).pipe(
+            catchError(() => of([]))
+        );
+    }
+
+    sendReminder(loanId: string) {
+        return this.http.post(`${this.apiUrl}/loans/${loanId}/remind`, {});
     }
 }

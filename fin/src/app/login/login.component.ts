@@ -1,12 +1,13 @@
 import { Component, inject, signal } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
+import { Router, RouterLink } from '@angular/router';
 import { AuthService } from '../auth.service';
 
 @Component({
   selector: 'app-login',
   standalone: true,
-  imports: [CommonModule, FormsModule],
+  imports: [CommonModule, FormsModule, RouterLink],
   template: `
     <div class="login-container">
       <!-- Glow Effect backdrop -->
@@ -35,6 +36,9 @@ import { AuthService } from '../auth.service';
                     <!-- Eye Off Icon (Hide) -->
                     <svg *ngIf="showPassword()" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M1 1l22 22"></path><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"></path></svg>
                 </button>
+            </div>
+            <div style="text-align: right; margin-top: 0.5rem;">
+                <a routerLink="/forgot-password" class="text-link-sm">Forgot Password?</a>
             </div>
         </div>
 
@@ -206,6 +210,17 @@ import { AuthService } from '../auth.service';
       gap: 10px;
       justify-content: center;
       border: 1px solid rgba(239, 68, 68, 0.2);
+    }
+    .text-link-sm {
+        font-size: 0.8rem;
+        color: var(--text-med);
+        text-decoration: none;
+        transition: color 0.2s;
+        cursor: pointer;
+    }
+    .text-link-sm:hover {
+        color: var(--primary);
+        text-decoration: underline;
     }
   `]
 })

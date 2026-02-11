@@ -4,13 +4,15 @@ import { CommonModule } from '@angular/common';
 import { ThemeService } from './theme.service';
 import { LoanService, Transaction } from './loan.service';
 import { AuthService } from './auth.service';
+import { RouterOutlet } from '@angular/router';
 import { LoginComponent } from './login/login.component';
+import { ProfileSettingsComponent } from './settings/profile-settings.component';
 import * as XLSX from 'xlsx';
 
 @Component({
   selector: 'app-root',
   standalone: true,
-  imports: [FormsModule, CommonModule, LoginComponent],
+  imports: [FormsModule, CommonModule, RouterOutlet, ProfileSettingsComponent],
   templateUrl: './app.html',
   styleUrl: './app.css'
 })
@@ -47,6 +49,7 @@ export class App {
   // Modal Signals
   showAddBorrowerModal = signal(false);
   showAddTransactionModal = signal(false);
+  fabOpen = signal(false);
 
   // Rename State
   isEditingName = signal(false);
@@ -96,6 +99,103 @@ export class App {
     return this.loanService.getChartPath(isArea, this.chartPeriod());
   }
   activeMonthlyExpected = this.loanService.activeMonthlyExpected;
+
+  // Analytics
+  loanStatusBreakdown = this.loanService.loanStatusBreakdown;
+  interestStats = this.loanService.interestStats;
+  cashFlowForecast = this.loanService.cashFlowForecast;
+  topBorrowers = this.loanService.topBorrowers;
+  overdueLoans = this.loanService.overdueLoans;
+
+  // Loan Calculator State
+  showCalculator = signal(false);
+  calcPrincipal = signal<number | null>(null);
+  calcRate = signal<number | null>(null);
+  calcTenure = signal<number | null>(null);
+  calcFrequency = signal<'Monthly' | 'Weekly'>('Monthly');
+
+  calcResult = computed(() => {
+    const p = this.calcPrincipal();
+    const r = this.calcRate();
+    const t = this.calcTenure();
+    const f = this.calcFrequency();
+
+    if (!p || !r || !t) return null;
+
+    // Standard EMI formula: E = P * r * (1+r)^n / ((1+r)^n - 1)
+    // Rate is annual %, need to convert to period rate
+    // Monthly: r / 12 / 100
+    // Weekly: r / 52 / 100
+
+    let periodRate = 0;
+    if (f === 'Monthly') periodRate = r / 12 / 100;
+    else periodRate = r / 52 / 100;
+
+    const n = t;
+    let emi = 0;
+
+    if (periodRate === 0) {
+      emi = p / n;
+    } else {
+      emi = (p * periodRate * Math.pow(1 + periodRate, n)) / (Math.pow(1 + periodRate, n) - 1);
+    }
+
+    const totalPayable = emi * n;
+    const totalInterest = totalPayable - p;
+
+    return {
+      emi,
+      totalInterest,
+      totalPayable
+    };
+  });
+
+  // Audit Log
+  auditLog = signal<{ type: string, message: string, timestamp: string }[]>([]);
+
+  constructor() {
+    // Poll for audit log updates every 5s (simple implementation)
+    // In production, use WebSockets or SSE
+    setInterval(() => {
+      this.refreshAuditLog();
+    }, 5000);
+    this.refreshAuditLog();
+  }
+
+  refreshAuditLog() {
+    this.loanService.getAuditLog().subscribe(logs => {
+      this.auditLog.set(logs);
+    });
+  }
+
+  sendReminder(t: Transaction) {
+    if (!confirm(`Send SMS reminder to ${t.name} for ${t.frequency} payment?`)) return;
+
+    this.loanService.sendReminder(t.id).subscribe({
+      next: (res: any) => {
+        alert(res.message);
+        this.refreshAuditLog();
+      },
+      error: (err) => alert('Failed to send reminder: ' + err.error?.error || 'Unknown error')
+    });
+  }
+
+  // Pie Chart SVG Helper
+  getPieSlicePath(startAngle: number, endAngle: number, radius: number = 40, cx: number = 50, cy: number = 50): string {
+    if (endAngle - startAngle >= 360) {
+      // Full circle — draw two arcs
+      const r = radius;
+      return `M ${cx},${cy - r} A ${r},${r} 0 1 1 ${cx},${cy + r} A ${r},${r} 0 1 1 ${cx},${cy - r} Z`;
+    }
+    const startRad = (startAngle - 90) * Math.PI / 180;
+    const endRad = (endAngle - 90) * Math.PI / 180;
+    const x1 = cx + radius * Math.cos(startRad);
+    const y1 = cy + radius * Math.sin(startRad);
+    const x2 = cx + radius * Math.cos(endRad);
+    const y2 = cy + radius * Math.sin(endRad);
+    const largeArc = endAngle - startAngle > 180 ? 1 : 0;
+    return `M ${cx},${cy} L ${x1},${y1} A ${radius},${radius} 0 ${largeArc} 1 ${x2},${y2} Z`;
+  }
 
 
   // Borrowers Stats
@@ -177,7 +277,7 @@ export class App {
     });
   });
 
-  constructor() { }
+
 
   // Helpers (Delegated to Service)
   getAmountReceived(t: Transaction): number {
@@ -512,5 +612,16 @@ export class App {
 
   cancelNameEdit() {
     this.isEditingName.set(false);
+  }
+
+  handleImportFile(event: Event) {
+    const input = event.target as HTMLInputElement;
+    if (input.files && input.files[0]) {
+      this.loanService.importData(input.files[0]).then(
+        (msg) => alert(msg),
+        (err) => alert('Import failed: ' + err)
+      );
+      input.value = ''; // Reset so same file can be re-imported
+    }
   }
 }

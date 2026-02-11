@@ -11,15 +11,15 @@ export class AuthService {
     private apiUrl = 'http://localhost:3000';
 
     // Auth State
-    isLoggedIn = signal<boolean>(false);
+    isLoggedIn = signal<boolean>(true); // Login disabled - always authenticated
     isLoading = signal<boolean>(false);
 
     constructor() {
-        // Check local storage on init
-        const token = typeof localStorage !== 'undefined' ? localStorage.getItem('auth_token') : null;
-        if (token) {
-            this.isLoggedIn.set(true);
-        }
+        // Login disabled - skip token check
+        // const token = typeof localStorage !== 'undefined' ? localStorage.getItem('auth_token') : null;
+        // if (token) {
+        //     this.isLoggedIn.set(true);
+        // }
     }
 
     login(username: string, password: string) {
@@ -43,5 +43,23 @@ export class AuthService {
     logout() {
         this.isLoggedIn.set(false);
         localStorage.removeItem('auth_token');
+    }
+
+    forgotPassword(username: string, phoneNumber: string) {
+        return this.http.post<{ success: boolean, message: string }>(`${this.apiUrl}/auth/forgot-password`, { username, phoneNumber });
+    }
+
+    verifyOtp(data: any) {
+        return this.http.post<{ success: boolean, message: string }>(`${this.apiUrl}/auth/verify-otp`, data);
+    }
+
+    updateProfile(data: any) {
+        return this.http.put<{ success: boolean, message: string, token?: string }>(`${this.apiUrl}/auth/profile`, data).pipe(
+            tap(res => {
+                if (res.token) {
+                    localStorage.setItem('auth_token', res.token);
+                }
+            })
+        );
     }
 }
