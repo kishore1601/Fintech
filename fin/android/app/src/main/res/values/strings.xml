@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Fintech App</string>
+    <string name="title_activity_main">Fintech App</string>
+    <string name="package_name">com.kishorefintech.app</string>
+    <string name="custom_url_scheme">com.kishorefintech.app</string>
+</resources>
