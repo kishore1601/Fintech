@@ -39,7 +39,7 @@ export interface DashboardSummary {
 })
 export class LoanService {
     private http = inject(HttpClient);
-    private apiUrl = 'http://localhost:3000'; // Base URL
+    private apiUrl = 'https://my-backend-api-o0et.onrender.com'; // Base URL
 
     // State
     connectionError = signal<string | null>(null);

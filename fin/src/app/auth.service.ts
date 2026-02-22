@@ -8,7 +8,7 @@ import { of } from 'rxjs';
 })
 export class AuthService {
     private http = inject(HttpClient);
-    private apiUrl = 'http://localhost:3000';
+    private apiUrl = 'https://my-backend-api-o0et.onrender.com';
 
     // Auth State
     isLoggedIn = signal<boolean>(true); // Login disabled - always authenticated
