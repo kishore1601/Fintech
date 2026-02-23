@@ -13,28 +13,21 @@ app.use(bodyParser.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key-change-me';
 
-// Initialize Admin User if not exists
-async function initializeDefaultUser() {
-    const users = db.get('users');
-    let admin = users.find(u => u.username === 'admin');
+// Initialize Database & Default Admin User
+async function initializeApp() {
+    await db.initialize();
 
-    if (!admin) {
+    const result = await db.query('SELECT * FROM users WHERE username = $1', ['admin']);
+    if (result.rows.length === 0) {
         const hashedPassword = await bcrypt.hash('admin123', 10);
-        db.add('users', {
-            id: 'admin',
-            username: 'admin',
-            password: hashedPassword,
-            role: 'admin',
-            phoneNumber: '1234567890'
-        });
+        await db.query(
+            'INSERT INTO users (id, username, password, role, phone_number) VALUES ($1, $2, $3, $4, $5)',
+            ['admin', 'admin', hashedPassword, 'admin', '1234567890']
+        );
         console.log('Default admin user created: admin / admin123 / 1234567890');
-    } else if (!admin.phoneNumber) {
-        // Migration: Add phone number to existing admin
-        db.update('users', admin.id, { phoneNumber: '1234567890' });
-        console.log('Updated default admin user with phone number: 1234567890');
     }
 }
-initializeDefaultUser();
+initializeApp();
 
 // Middleware: Authenticate Token
 function authenticateToken(req, res, next) {
@@ -50,409 +43,567 @@ function authenticateToken(req, res, next) {
     });
 }
 
-// Routes
+// Helper: Generate random ID
+function generateId() {
+    return Math.random().toString(36).substr(2, 9);
+}
+
+// Helper: Audit Log
+async function logAudit(type, message) {
+    const id = generateId();
+    await db.query(
+        'INSERT INTO audit_log (id, type, message) VALUES ($1, $2, $3)',
+        [id, type, message]
+    );
+}
+
+// ================== AUTH ROUTES ==================
 
 // POST /login
 app.post('/login', async (req, res) => {
-    const { username, password } = req.body;
-    const user = db.find('users', u => u.username === username);
+    try {
+        const { username, password } = req.body;
+        const result = await db.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
 
-    if (!user) {
-        return res.status(401).json({ error: 'Invalid credentials' });
+        if (!user) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign({ username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+        res.json({ success: true, token, user: { username: user.username, phoneNumber: user.phone_number } });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: 'Server error' });
     }
-
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-    }
-
-    const token = jwt.sign({ username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
-    res.json({ success: true, token, user: { username: user.username, phoneNumber: user.phoneNumber } });
 });
 
 // POST /auth/forgot-password - Generate OTP
-app.post('/auth/forgot-password', (req, res) => {
-    const { username } = req.body;
-    const user = db.find('users', u => u.username === username);
+app.post('/auth/forgot-password', async (req, res) => {
+    try {
+        const { username } = req.body;
+        const result = await db.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
 
-    if (!user) {
-        // Generic message for security, but for demo we can be explicit or just fail
-        return res.status(404).json({ error: 'User not found' });
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        if (!user.phone_number) {
+            return res.status(400).json({ error: 'No phone number linked to this account.' });
+        }
+
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+
+        await db.query(
+            'UPDATE users SET otp = $1, otp_expires = $2 WHERE id = $3',
+            [otp, Date.now() + 300000, user.id]
+        );
+
+        // Twilio SMS
+        const authToken = process.env.TWILIO_AUTH_TOKEN;
+        const accountSid = process.env.TWILIO_ACCOUNT_SID;
+        if (accountSid && authToken) {
+            const client = require('twilio')(accountSid, authToken);
+            client.messages
+                .create({
+                    body: `Your OTP is ${otp}`,
+                    from: process.env.TWILIO_PHONE_NUMBER,
+                    to: user.phone_number
+                })
+                .then(message => console.log(message.sid))
+                .catch(err => console.error('SMS Error:', err));
+        }
+
+        console.log(`[SMS] OTP for ${username} (${user.phone_number}): ${otp}`);
+
+        res.json({
+            success: true,
+            message: `OTP sent to linked phone ending in ...${user.phone_number.slice(-4)}`,
+            debugOtp: otp
+        });
+    } catch (err) {
+        console.error('Forgot password error:', err);
+        res.status(500).json({ error: 'Server error' });
     }
-
-    if (!user.phoneNumber) {
-        return res.status(400).json({ error: 'No phone number linked to this account.' });
-    }
-
-    // Generate 6-digit OTP
-    const otp = Math.floor(100000 + Math.random() * 900000).toString();
-
-    // Save OTP to DB (or memory store with expiration) - Simple DB approach
-    // We'll store it on the user object for simplicity in this demo
-    db.update('users', user.id, {
-        otp: otp,
-        otpExpires: Date.now() + 300000 // 5 mins 
-    });
-
-    // MOCK SMS SENDING
-    // console.log(`[MOCK SMS] OTP for ${username} (${user.phoneNumber}): ${otp}`);
-
-    const authToken = process.env.TWILIO_AUTH_TOKEN;
-    const accountSid = process.env.TWILIO_ACCOUNT_SID;
-    const client = require('twilio')(accountSid, authToken);
-
-    client.messages
-        .create({
-            body: `Your OTP is ${otp}`,
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: user.phoneNumber
-        })
-        .then(message => console.log(message.sid));
-
-    console.log(`[MOCK SMS] OTP for ${username} (${user.phoneNumber}): ${otp}`);
-
-    res.json({
-        success: true,
-        message: `OTP sent to linked phone ending in ...${user.phoneNumber.slice(-4)}`,
-        debugOtp: otp // Included for demo purposes so it's visible in network tab/frontend
-    });
 });
 
 // POST /auth/verify-otp - Verify OTP and Reset Password
 app.post('/auth/verify-otp', async (req, res) => {
-    const { username, otp, newPassword } = req.body;
-    const user = db.find('users', u => u.username === username);
+    try {
+        const { username, otp, newPassword } = req.body;
+        const result = await db.query('SELECT * FROM users WHERE username = $1', [username]);
+        const user = result.rows[0];
 
-    if (!user) return res.status(404).json({ error: 'User not found' });
+        if (!user) return res.status(404).json({ error: 'User not found' });
 
-    if (!user.otp || user.otp !== otp) {
-        return res.status(400).json({ error: 'Invalid OTP' });
+        if (!user.otp || user.otp !== otp) {
+            return res.status(400).json({ error: 'Invalid OTP' });
+        }
+
+        if (Date.now() > user.otp_expires) {
+            return res.status(400).json({ error: 'OTP Expired' });
+        }
+
+        const hashedPassword = await bcrypt.hash(newPassword, 10);
+        await db.query(
+            'UPDATE users SET password = $1, otp = NULL, otp_expires = NULL WHERE id = $2',
+            [hashedPassword, user.id]
+        );
+
+        res.json({ success: true, message: 'Password reset successfully' });
+    } catch (err) {
+        console.error('Verify OTP error:', err);
+        res.status(500).json({ error: 'Server error' });
     }
-
-    if (Date.now() > user.otpExpires) {
-        return res.status(400).json({ error: 'OTP Expired' });
-    }
-
-    // Reset Password
-    const hashedPassword = await bcrypt.hash(newPassword, 10);
-    db.update('users', user.id, {
-        password: hashedPassword,
-        otp: null,
-        otpExpires: null
-    });
-
-    res.json({ success: true, message: 'Password reset successfully' });
 });
 
-// PUT /auth/profile - Update Profile (Username, Password, Phone)
+// PUT /auth/profile - Update Profile
 app.put('/auth/profile', async (req, res) => {
-    const { currentPassword, newUsername, newPassword, newPhone } = req.body;
-    const userId = req.user.username; // In our JWT payload we stored username as ID effectively, ideally use ID.
-    // Let's find user by the username from token
-    let user = db.find('users', u => u.username === req.user.username);
+    try {
+        const { currentPassword, newUsername, newPassword, newPhone } = req.body;
+        const result = await db.query('SELECT * FROM users WHERE username = $1', [req.body.currentUsername || 'admin']);
+        const user = result.rows[0];
 
-    if (!user) return res.status(404).json({ error: 'User not found' });
+        if (!user) return res.status(404).json({ error: 'User not found' });
 
-    // Verify Current Password
-    const validPassword = await bcrypt.compare(currentPassword, user.password);
-    if (!validPassword) {
-        return res.status(401).json({ error: 'Incorrect current password' });
-    }
+        const validPassword = await bcrypt.compare(currentPassword, user.password);
+        if (!validPassword) {
+            return res.status(401).json({ error: 'Incorrect current password' });
+        }
 
-    const updates = {};
-    if (newUsername && newUsername !== user.username) {
-        // Check if taken
-        const existing = db.find('users', u => u.username === newUsername);
-        if (existing) return res.status(400).json({ error: 'Username already taken' });
-        updates.username = newUsername;
-    }
-    if (newPhone) {
-        updates.phoneNumber = newPhone;
-    }
-    if (newPassword) {
-        updates.password = await bcrypt.hash(newPassword, 10);
-    }
+        if (newUsername && newUsername !== user.username) {
+            const existing = await db.query('SELECT * FROM users WHERE username = $1', [newUsername]);
+            if (existing.rows.length > 0) return res.status(400).json({ error: 'Username already taken' });
+            await db.query('UPDATE users SET username = $1 WHERE id = $2', [newUsername, user.id]);
+        }
+        if (newPhone) {
+            await db.query('UPDATE users SET phone_number = $1 WHERE id = $2', [newPhone, user.id]);
+        }
+        if (newPassword) {
+            const hashedPassword = await bcrypt.hash(newPassword, 10);
+            await db.query('UPDATE users SET password = $1 WHERE id = $2', [hashedPassword, user.id]);
+        }
 
-    if (Object.keys(updates).length > 0) {
-        db.update('users', user.id, updates);
-
-        // If username changed, generate new token
-        if (updates.username) {
-            const newToken = jwt.sign({ username: updates.username, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
+        if (newUsername && newUsername !== user.username) {
+            const newToken = jwt.sign({ username: newUsername, role: user.role }, JWT_SECRET, { expiresIn: '24h' });
             return res.json({ success: true, message: 'Profile updated', token: newToken });
         }
 
         res.json({ success: true, message: 'Profile updated' });
-    } else {
-        res.json({ success: true, message: 'No changes made' });
+    } catch (err) {
+        console.error('Profile update error:', err);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
+// ================== BORROWER ROUTES ==================
+
 // GET /borrowers
-app.get('/borrowers', (req, res) => {
-    const transactions = db.get('transactions');
-    const borrowers = db.get('borrowers');
+app.get('/borrowers', async (req, res) => {
+    try {
+        const borrowersResult = await db.query('SELECT * FROM borrowers');
+        const transactionsResult = await db.query('SELECT DISTINCT name FROM transactions');
 
-    // 1. Get unique names from transactions
-    const transactionNames = new Set(transactions.map(t => t.name));
+        const allBorrowers = [...borrowersResult.rows];
 
-    // 2. Start with standalone borrowers
-    const allBorrowers = [...borrowers];
+        // Add transaction-only borrowers not already in borrowers table
+        transactionsResult.rows.forEach(t => {
+            if (!allBorrowers.find(b => b.name === t.name)) {
+                allBorrowers.push({ name: t.name, activeLoans: 0 });
+            }
+        });
 
-    // 3. Add transaction borrowers if not already in list
-    transactionNames.forEach(name => {
-        if (!allBorrowers.find(b => b.name === name)) {
-            allBorrowers.push({ name, activeLoans: 0 });
-        }
-    });
-
-    res.json(allBorrowers);
+        res.json(allBorrowers);
+    } catch (err) {
+        console.error('Get borrowers error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // POST /borrowers
-app.post('/borrowers', (req, res) => {
-    const borrower = req.body;
-    borrower.id = Math.random().toString(36).substr(2, 9);
-    borrower.created_at = new Date().toISOString();
+app.post('/borrowers', async (req, res) => {
+    try {
+        const borrower = req.body;
+        borrower.id = generateId();
 
-    db.add('borrowers', borrower);
-    console.log('Created Borrower:', borrower);
-    logAudit('create', `Created new borrower: ${borrower.name}`);
-    res.json(borrower);
-});
+        await db.query(
+            'INSERT INTO borrowers (id, name, phone, notes) VALUES ($1, $2, $3, $4)',
+            [borrower.id, borrower.name, borrower.phone || '', borrower.notes || '']
+        );
 
-// GET /loans
-app.get('/loans', (req, res) => {
-    res.json(db.get('transactions'));
-});
-
-// POST /loans
-app.post('/loans', (req, res) => {
-    const loan = req.body;
-    loan.id = Math.random().toString(36).substr(2, 9);
-    loan.repayments = [];
-
-    db.add('transactions', loan);
-    console.log('Created Loan:', loan);
-    logAudit('lend', `Disbursed loan of Rs.${loan.amountGiven} to ${loan.name}`);
-    res.json(loan);
-});
-
-// POST /payments
-app.post('/payments', (req, res) => {
-    const { loanId, amount, date } = req.body;
-    const loan = db.find('transactions', t => t.id === loanId);
-
-    if (loan) {
-        const payment = {
-            id: Math.random().toString(36).substr(2, 9),
-            date: date || new Date().toISOString(),
-            amount
-        };
-
-        // Directly mutating object reference from db.find/get works because it's in-memory
-        // But we must save to persist
-        loan.repayments.push(payment);
-        db.save();
-
-        console.log(`Payment recorded for ${loan.name}: ${amount}`);
-        logAudit('payment', `Received payment of Rs.${amount} from ${loan.name}`);
-        res.json({ success: true, loan, paymentId: payment.id });
-    } else {
-        res.status(404).json({ error: 'Loan not found' });
-    }
-});
-
-// PUT /loans/:loanId/payments/:paymentId
-app.put('/loans/:loanId/payments/:paymentId', (req, res) => {
-    const { loanId, paymentId } = req.params;
-    const updates = req.body;
-
-    const loan = db.find('transactions', t => t.id === loanId);
-    if (!loan) return res.status(404).json({ error: 'Loan not found' });
-
-    let paymentIndex = loan.repayments.findIndex(r => r.id === paymentId);
-
-    if (paymentIndex === -1) {
-        const index = parseInt(paymentId);
-        if (!isNaN(index) && index >= 0 && index < loan.repayments.length) {
-            paymentIndex = index;
-        }
-    }
-
-    if (paymentIndex !== -1) {
-        loan.repayments[paymentIndex] = { ...loan.repayments[paymentIndex], ...updates };
-        db.save();
-        console.log(`Updated Payment ${paymentId} for Loan ${loanId}`);
-        logAudit('update', `Updated payment record for ${loan.name}`);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'Payment not found' });
-    }
-});
-
-// PUT /loans/:id
-app.put('/loans/:id', (req, res) => {
-    const { id } = req.params;
-    const updates = req.body;
-
-    // Use db.update convenience method
-    const updatedLoan = db.update('transactions', id, updates);
-
-    if (updatedLoan) {
-        console.log('Updated Loan:', updatedLoan);
-        logAudit('update', `Updated loan details for ${updatedLoan.name}`);
-        res.json(updatedLoan);
-    } else {
-        res.status(404).json({ error: 'Loan not found' });
-    }
-});
-
-// DELETE /loans/:loanId/payments/:paymentId
-app.delete('/loans/:loanId/payments/:paymentId', (req, res) => {
-    const { loanId, paymentId } = req.params;
-
-    const loan = db.find('transactions', t => t.id === loanId);
-    if (!loan) return res.status(404).json({ error: 'Loan not found' });
-
-    const initialLength = loan.repayments.length;
-    loan.repayments = loan.repayments.filter(r => r.id !== paymentId);
-
-    if (loan.repayments.length === initialLength) {
-        const index = parseInt(paymentId);
-        if (!isNaN(index) && index >= 0 && index < initialLength) {
-            loan.repayments = loan.repayments.filter((_, i) => i !== index);
-        }
-    }
-
-    if (loan.repayments.length < initialLength) {
-        db.save();
-        console.log(`Deleted Payment ${paymentId} from Loan ${loanId}`);
-        logAudit('delete', `Deleted payment record for ${loan.name}`);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'Payment not found' });
-    }
-});
-
-// DELETE /loans/:id
-app.delete('/loans/:id', (req, res) => {
-    const { id } = req.params;
-    const loan = db.find('transactions', t => t.id === id); // Get for name before delete
-    const name = loan ? loan.name : 'Unknown';
-    const deleted = db.delete('transactions', id);
-
-    if (deleted) {
-        console.log('Deleted Loan:', id);
-        logAudit('delete', `Deleted loan record for ${name}`);
-        res.json({ success: true });
-    } else {
-        res.status(404).json({ error: 'Loan not found' });
+        const result = await db.query('SELECT * FROM borrowers WHERE id = $1', [borrower.id]);
+        console.log('Created Borrower:', result.rows[0]);
+        await logAudit('create', `Created new borrower: ${borrower.name}`);
+        res.json(result.rows[0]);
+    } catch (err) {
+        console.error('Create borrower error:', err);
+        res.status(500).json({ error: 'Server error' });
     }
 });
 
 // DELETE /borrowers/:name
-app.delete('/borrowers/:name', (req, res) => {
-    const { name } = req.params;
+app.delete('/borrowers/:name', async (req, res) => {
+    try {
+        const { name } = req.params;
 
-    // Custom delete logic for non-ID based delete
-    const transactions = db.get('transactions');
-    const borrowers = db.get('borrowers');
+        // Delete all transactions (repayments cascade) for this borrower
+        await db.query('DELETE FROM repayments WHERE transaction_id IN (SELECT id FROM transactions WHERE name = $1)', [name]);
+        await db.query('DELETE FROM transactions WHERE name = $1', [name]);
+        await db.query('DELETE FROM borrowers WHERE name = $1', [name]);
 
-    const initialTCount = transactions.length;
-    const initialBCount = borrowers.length;
-
-    // Filter out matches
-    db.data.transactions = transactions.filter(t => t.name !== name);
-    db.data.borrowers = borrowers.filter(b => b.name !== name);
-
-    db.save();
-
-    console.log('Deleted Borrower:', name);
-    logAudit('delete', `Deleted borrower: ${name}`);
-    res.json({ success: true });
+        console.log('Deleted Borrower:', name);
+        await logAudit('delete', `Deleted borrower: ${name}`);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('Delete borrower error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // PUT /borrowers/:name
-app.put('/borrowers/:name', (req, res) => {
-    const { name } = req.params;
-    const { newName } = req.body;
+app.put('/borrowers/:name', async (req, res) => {
+    try {
+        const { name } = req.params;
+        const { newName } = req.body;
 
-    if (!newName) {
-        return res.status(400).json({ error: 'New name is required' });
-    }
-
-    // 1. Update standalone borrowers
-    const borrower = db.find('borrowers', b => b.name === name);
-    if (borrower) {
-        borrower.name = newName;
-    }
-
-    // 2. Update all transactions for this borrower
-    const transactions = db.get('transactions');
-    let updatedCount = 0;
-    transactions.forEach(t => {
-        if (t.name === name) {
-            t.name = newName;
-            updatedCount++;
+        if (!newName) {
+            return res.status(400).json({ error: 'New name is required' });
         }
-    });
 
-    db.save();
-    console.log(`Renamed Borrower: ${name} -> ${newName} (${updatedCount} transactions updated)`);
-    res.json({ success: true, oldName: name, newName: newName });
+        // Update borrowers table
+        await db.query('UPDATE borrowers SET name = $1 WHERE name = $2', [newName, name]);
+
+        // Update all transactions for this borrower
+        const result = await db.query('UPDATE transactions SET name = $1 WHERE name = $2', [newName, name]);
+
+        console.log(`Renamed Borrower: ${name} -> ${newName} (${result.rowCount} transactions updated)`);
+        res.json({ success: true, oldName: name, newName: newName });
+    } catch (err) {
+        console.error('Rename borrower error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
-// Helper: Audit Log
-function logAudit(type, message) {
-    const entry = {
-        id: Math.random().toString(36).substr(2, 9),
-        type,
-        message,
-        timestamp: new Date().toISOString()
-    };
-    db.add('audit_log', entry);
-    return entry;
-}
+// ================== LOAN ROUTES ==================
+
+// GET /loans
+app.get('/loans', async (req, res) => {
+    try {
+        const loansResult = await db.query('SELECT * FROM transactions');
+        const loans = loansResult.rows;
+
+        // Fetch repayments for all loans
+        for (let loan of loans) {
+            const repaymentsResult = await db.query(
+                'SELECT * FROM repayments WHERE transaction_id = $1',
+                [loan.id]
+            );
+            // Map DB columns to the format frontend expects
+            loan.dateGiven = loan.date_given;
+            loan.amountGiven = Number(loan.amount_given);
+            loan.percentage = Number(loan.percentage);
+            loan.installmentAmount = Number(loan.installment_amount);
+            loan.repayments = repaymentsResult.rows.map(r => ({
+                id: r.id,
+                date: r.date,
+                amount: Number(r.amount)
+            }));
+            // Clean up DB-specific column names
+            delete loan.date_given;
+            delete loan.amount_given;
+            delete loan.installment_amount;
+        }
+
+        res.json(loans);
+    } catch (err) {
+        console.error('Get loans error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// POST /loans
+app.post('/loans', async (req, res) => {
+    try {
+        const loan = req.body;
+        loan.id = generateId();
+
+        await db.query(
+            'INSERT INTO transactions (id, name, date_given, amount_given, percentage, frequency, installment_amount) VALUES ($1, $2, $3, $4, $5, $6, $7)',
+            [loan.id, loan.name, loan.dateGiven, loan.amountGiven, loan.percentage, loan.frequency, loan.installmentAmount || 0]
+        );
+
+        loan.repayments = [];
+        console.log('Created Loan:', loan);
+        await logAudit('lend', `Disbursed loan of Rs.${loan.amountGiven} to ${loan.name}`);
+        res.json(loan);
+    } catch (err) {
+        console.error('Create loan error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PUT /loans/:id
+app.put('/loans/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const updates = req.body;
+
+        // Build dynamic update query for allowed fields
+        const fieldMap = {
+            name: 'name',
+            dateGiven: 'date_given',
+            amountGiven: 'amount_given',
+            percentage: 'percentage',
+            frequency: 'frequency',
+            installmentAmount: 'installment_amount'
+        };
+
+        const setClauses = [];
+        const values = [];
+        let paramIndex = 1;
+
+        for (const [jsKey, dbCol] of Object.entries(fieldMap)) {
+            if (updates[jsKey] !== undefined) {
+                setClauses.push(`${dbCol} = $${paramIndex}`);
+                values.push(updates[jsKey]);
+                paramIndex++;
+            }
+        }
+
+        if (setClauses.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+
+        values.push(id);
+        await db.query(
+            `UPDATE transactions SET ${setClauses.join(', ')} WHERE id = $${paramIndex}`,
+            values
+        );
+
+        // Fetch and return updated loan
+        const loanResult = await db.query('SELECT * FROM transactions WHERE id = $1', [id]);
+        if (loanResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Loan not found' });
+        }
+
+        const loan = loanResult.rows[0];
+        loan.dateGiven = loan.date_given;
+        loan.amountGiven = Number(loan.amount_given);
+        loan.percentage = Number(loan.percentage);
+        loan.installmentAmount = Number(loan.installment_amount);
+
+        const repaymentsResult = await db.query('SELECT * FROM repayments WHERE transaction_id = $1', [id]);
+        loan.repayments = repaymentsResult.rows.map(r => ({ id: r.id, date: r.date, amount: Number(r.amount) }));
+
+        delete loan.date_given;
+        delete loan.amount_given;
+        delete loan.installment_amount;
+
+        console.log('Updated Loan:', loan);
+        await logAudit('update', `Updated loan details for ${loan.name}`);
+        res.json(loan);
+    } catch (err) {
+        console.error('Update loan error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// DELETE /loans/:id
+app.delete('/loans/:id', async (req, res) => {
+    try {
+        const { id } = req.params;
+
+        // Get loan name for audit log before deleting
+        const loanResult = await db.query('SELECT name FROM transactions WHERE id = $1', [id]);
+        const name = loanResult.rows[0]?.name || 'Unknown';
+
+        // Delete repayments first, then loan
+        await db.query('DELETE FROM repayments WHERE transaction_id = $1', [id]);
+        const result = await db.query('DELETE FROM transactions WHERE id = $1', [id]);
+
+        if (result.rowCount > 0) {
+            console.log('Deleted Loan:', id);
+            await logAudit('delete', `Deleted loan record for ${name}`);
+            res.json({ success: true });
+        } else {
+            res.status(404).json({ error: 'Loan not found' });
+        }
+    } catch (err) {
+        console.error('Delete loan error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ================== PAYMENT ROUTES ==================
+
+// POST /payments
+app.post('/payments', async (req, res) => {
+    try {
+        const { loanId, amount, date } = req.body;
+
+        // Check loan exists
+        const loanResult = await db.query('SELECT * FROM transactions WHERE id = $1', [loanId]);
+        if (loanResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Loan not found' });
+        }
+        const loan = loanResult.rows[0];
+
+        const paymentId = generateId();
+        const paymentDate = date || new Date().toISOString();
+
+        await db.query(
+            'INSERT INTO repayments (id, transaction_id, date, amount) VALUES ($1, $2, $3, $4)',
+            [paymentId, loanId, paymentDate, amount]
+        );
+
+        console.log(`Payment recorded for ${loan.name}: ${amount}`);
+        await logAudit('payment', `Received payment of Rs.${amount} from ${loan.name}`);
+
+        // Return loan with updated repayments
+        const repaymentsResult = await db.query('SELECT * FROM repayments WHERE transaction_id = $1', [loanId]);
+        const repayments = repaymentsResult.rows.map(r => ({ id: r.id, date: r.date, amount: Number(r.amount) }));
+
+        res.json({ success: true, loan: { ...loan, repayments }, paymentId });
+    } catch (err) {
+        console.error('Create payment error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// PUT /loans/:loanId/payments/:paymentId
+app.put('/loans/:loanId/payments/:paymentId', async (req, res) => {
+    try {
+        const { loanId, paymentId } = req.params;
+        const updates = req.body;
+
+        // Check loan exists
+        const loanResult = await db.query('SELECT * FROM transactions WHERE id = $1', [loanId]);
+        if (loanResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Loan not found' });
+        }
+
+        const setClauses = [];
+        const values = [];
+        let paramIndex = 1;
+
+        if (updates.amount !== undefined) {
+            setClauses.push(`amount = $${paramIndex}`);
+            values.push(updates.amount);
+            paramIndex++;
+        }
+        if (updates.date !== undefined) {
+            setClauses.push(`date = $${paramIndex}`);
+            values.push(updates.date);
+            paramIndex++;
+        }
+
+        if (setClauses.length === 0) {
+            return res.status(400).json({ error: 'No valid fields to update' });
+        }
+
+        values.push(paymentId);
+        values.push(loanId);
+        const result = await db.query(
+            `UPDATE repayments SET ${setClauses.join(', ')} WHERE id = $${paramIndex} AND transaction_id = $${paramIndex + 1}`,
+            values
+        );
+
+        if (result.rowCount > 0) {
+            console.log(`Updated Payment ${paymentId} for Loan ${loanId}`);
+            await logAudit('update', `Updated payment record for ${loanResult.rows[0].name}`);
+            res.json({ success: true });
+        } else {
+            res.status(404).json({ error: 'Payment not found' });
+        }
+    } catch (err) {
+        console.error('Update payment error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// DELETE /loans/:loanId/payments/:paymentId
+app.delete('/loans/:loanId/payments/:paymentId', async (req, res) => {
+    try {
+        const { loanId, paymentId } = req.params;
+
+        const loanResult = await db.query('SELECT * FROM transactions WHERE id = $1', [loanId]);
+        if (loanResult.rows.length === 0) {
+            return res.status(404).json({ error: 'Loan not found' });
+        }
+
+        const result = await db.query(
+            'DELETE FROM repayments WHERE id = $1 AND transaction_id = $2',
+            [paymentId, loanId]
+        );
+
+        if (result.rowCount > 0) {
+            console.log(`Deleted Payment ${paymentId} from Loan ${loanId}`);
+            await logAudit('delete', `Deleted payment record for ${loanResult.rows[0].name}`);
+            res.json({ success: true });
+        } else {
+            res.status(404).json({ error: 'Payment not found' });
+        }
+    } catch (err) {
+        console.error('Delete payment error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// ================== AUDIT & REMINDERS ==================
 
 // GET /audit-log
-app.get('/audit-log', (req, res) => {
-    const logs = db.get('audit_log');
-    // Return last 50 events, newest first
-    res.json(logs.slice(-50).reverse());
+app.get('/audit-log', async (req, res) => {
+    try {
+        const result = await db.query('SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT 50');
+        res.json(result.rows);
+    } catch (err) {
+        console.error('Get audit log error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
 
 // POST /loans/:id/remind
-app.post('/loans/:id/remind', (req, res) => {
-    const { id } = req.params;
-    const loan = db.find('transactions', t => t.id === id);
+app.post('/loans/:id/remind', async (req, res) => {
+    try {
+        const { id } = req.params;
+        const loanResult = await db.query('SELECT * FROM transactions WHERE id = $1', [id]);
 
-    if (!loan) return res.status(404).json({ error: 'Loan not found' });
+        if (loanResult.rows.length === 0) return res.status(404).json({ error: 'Loan not found' });
+        const loan = loanResult.rows[0];
 
-    // Find borrower phone
-    const borrower = db.find('borrowers', b => b.name === loan.name);
-    const phone = borrower?.phone || '1234567890'; // Fallback for demo
+        // Find borrower phone
+        const borrowerResult = await db.query('SELECT * FROM borrowers WHERE name = $1', [loan.name]);
+        const phone = borrowerResult.rows[0]?.phone || '1234567890';
 
-    // MOCK SMS if no env vars, or Real if present
-    const message = `Reminder: Payment for ${loan.frequency} loan of Rs.${loan.amountGiven} is due.`; // Simplified message
+        const message = `Reminder: Payment for ${loan.frequency} loan of Rs.${loan.amount_given} is due.`;
 
-    if (process.env.TWILIO_ACCOUNT_SID) {
-        const client = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-        client.messages.create({
-            body: message,
-            from: process.env.TWILIO_PHONE_NUMBER,
-            to: phone
-        }).then(msg => console.log('SMS Sent:', msg.sid)).catch(err => console.error('SMS Error:', err));
+        if (process.env.TWILIO_ACCOUNT_SID) {
+            const client = require('twilio')(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+            client.messages.create({
+                body: message,
+                from: process.env.TWILIO_PHONE_NUMBER,
+                to: phone
+            }).then(msg => console.log('SMS Sent:', msg.sid)).catch(err => console.error('SMS Error:', err));
+        }
+
+        console.log(`[SMS] To ${loan.name} (${phone}): ${message}`);
+        await logAudit('reminder', `Sent SMS reminder to ${loan.name}`);
+
+        res.json({ success: true, message: 'Reminder sent successfully' });
+    } catch (err) {
+        console.error('Remind error:', err);
+        res.status(500).json({ error: 'Server error' });
     }
-
-    console.log(`[SMS] To ${loan.name} (${phone}): ${message}`);
-    logAudit('reminder', `Sent SMS reminder to ${loan.name}`);
-
-    res.json({ success: true, message: 'Reminder sent successfully' });
 });
 
 // Start Server
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Backend Server running on http://localhost:${PORT}`);
 });

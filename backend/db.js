@@ -1,77 +1,67 @@
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
 
-const DB_FILE = path.join(__dirname, 'data', 'db.json');
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_URL ? { rejectUnauthorized: false } : false
+});
 
-class Database {
-    constructor() {
-        this.data = {
-            users: [],
-            borrowers: [],
-            transactions: [],
-            audit_log: []
-        };
-        this.load();
-    }
+async function initialize() {
+    const client = await pool.connect();
+    try {
+        await client.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password TEXT NOT NULL,
+                role TEXT DEFAULT 'admin',
+                phone_number TEXT,
+                otp TEXT,
+                otp_expires BIGINT
+            );
 
-    load() {
-        if (fs.existsSync(DB_FILE)) {
-            try {
-                const fileData = fs.readFileSync(DB_FILE, 'utf8');
-                this.data = JSON.parse(fileData);
-            } catch (err) {
-                console.error('Error reading DB file:', err);
-                this.save(); // Reset if corrupted
-            }
-        } else {
-            this.save(); // Create if not exists
-        }
-    }
+            CREATE TABLE IF NOT EXISTS borrowers (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                phone TEXT,
+                notes TEXT,
+                created_at TIMESTAMPTZ DEFAULT NOW()
+            );
 
-    save() {
-        try {
-            fs.writeFileSync(DB_FILE, JSON.stringify(this.data, null, 2));
-        } catch (err) {
-            console.error('Error writing DB file:', err);
-        }
-    }
+            CREATE TABLE IF NOT EXISTS transactions (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                date_given TEXT,
+                amount_given NUMERIC,
+                percentage NUMERIC,
+                frequency TEXT,
+                installment_amount NUMERIC DEFAULT 0
+            );
 
-    get(collection) {
-        return this.data[collection] || [];
-    }
+            CREATE TABLE IF NOT EXISTS repayments (
+                id TEXT PRIMARY KEY,
+                transaction_id TEXT REFERENCES transactions(id) ON DELETE CASCADE,
+                date TEXT,
+                amount NUMERIC
+            );
 
-    add(collection, item) {
-        if (!this.data[collection]) this.data[collection] = [];
-        this.data[collection].push(item);
-        this.save();
-        return item;
-    }
-
-    update(collection, id, updates) {
-        const list = this.data[collection];
-        const index = list.findIndex(item => item.id === id);
-        if (index !== -1) {
-            list[index] = { ...list[index], ...updates };
-            this.save();
-            return list[index];
-        }
-        return null;
-    }
-
-    delete(collection, id) {
-        const list = this.data[collection];
-        const index = list.findIndex(item => item.id === id);
-        if (index !== -1) {
-            list.splice(index, 1);
-            this.save();
-            return true;
-        }
-        return false;
-    }
-
-    find(collection, predicate) {
-        return this.data[collection].find(predicate);
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id TEXT PRIMARY KEY,
+                type TEXT,
+                message TEXT,
+                timestamp TIMESTAMPTZ DEFAULT NOW()
+            );
+        `);
+        console.log('Database tables initialized successfully');
+    } catch (err) {
+        console.error('Error initializing database:', err);
+    } finally {
+        client.release();
     }
 }
 
-module.exports = new Database();
+async function query(text, params) {
+    const result = await pool.query(text, params);
+    return result;
+}
+
+module.exports = { initialize, query, pool };
