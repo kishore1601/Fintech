@@ -1,4 +1,4 @@
-import { Component, signal, computed, inject } from '@angular/core';
+import { Component, signal, computed, inject, HostListener } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import { CommonModule } from '@angular/common';
 import { ThemeService } from './theme.service';
@@ -361,6 +361,7 @@ export class App {
   switchTab(tab: 'dashboard' | 'loans' | 'borrowers' | 'settings') {
     this.currentTab.set(tab);
     this.selectedBorrower.set(null);
+    this.showSettingsMenu.set(false);
   }
 
   // getProfit method removed as it's now handled within the service's getStatus logic

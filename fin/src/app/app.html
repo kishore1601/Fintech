@@ -1,5 +1,5 @@
 @if (authService.isLoggedIn()) {
-<div class="dashboard-container">
+<div class="dashboard-container" (click)="showSettingsMenu.set(false)">
   <!-- Top Nav -->
   <nav class="top-nav">
     <div class="logo">KishoreFintech</div>
@@ -15,7 +15,8 @@
     <div style="display: flex; align-items: center; gap: 2rem;">
       <!-- Settings Link with Dropdown -->
       <div class="nav-item" style="display: flex; align-items: center; gap: 8px; position: relative;"
-        [class.active]="showSettingsMenu()" (click)="showSettingsMenu.set(!showSettingsMenu())">
+        [class.active]="showSettingsMenu()"
+        (click)="$event.stopPropagation(); showSettingsMenu.set(!showSettingsMenu())">
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
           stroke-linecap="round" stroke-linejoin="round">
           <circle cx="12" cy="12" r="3"></circle>
